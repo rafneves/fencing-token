@@ -1,0 +1,72 @@
+version: '3.1'
+name: chap8-practical-examples
+
+services:
+  # Zookeeper in a 3 node cluster (we need even number of nodes to have a majority and avoid split-brain).
+  zoo1:
+    image: zookeeper
+    restart: always
+    hostname: zoo1
+    ports:
+      - 2181:2181
+      - 8080:8080
+    environment:
+      ZOO_MY_ID: 1
+      ZOO_SERVERS: server.1=zoo1:2888:3888;2181 server.2=zoo2:2888:3888;2181 server.3=zoo3:2888:3888;2181
+      ZOOKEEPER_QUORUM_LISTEN_ON_ALL_IPS: 'true'
+      # Set the number of maximum of concurrent client connections allowed by Zookeeper.
+      ZOO_MAX_CLIENT_CNXNS: 1000
+
+  zoo2:
+    image: zookeeper
+    restart: always
+    hostname: zoo2
+    ports:
+      - 2182:2181
+      - 8081:8080
+    environment:
+      ZOO_MY_ID: 2
+      ZOO_SERVERS: server.1=zoo1:2888:3888;2181 server.2=zoo2:2888:3888;2181 server.3=zoo3:2888:3888;2181
+      ZOOKEEPER_QUORUM_LISTEN_ON_ALL_IPS: 'true'      
+      # Set the number of maximum of concurrent client connections allowed by Zookeeper.
+      ZOO_MAX_CLIENT_CNXNS: 1000
+
+  zoo3:
+    image: zookeeper
+    restart: always
+    hostname: zoo3
+    ports:
+      - 2183:2181
+      - 8082:8080      
+    environment:
+      ZOO_MY_ID: 3
+      ZOO_SERVERS: server.1=zoo1:2888:3888;2181 server.2=zoo2:2888:3888;2181 server.3=zoo3:2888:3888;2181
+      ZOOKEEPER_QUORUM_LISTEN_ON_ALL_IPS: 'true'      
+      # Set the number of maximum of concurrent client connections allowed by Zookeeper.
+      ZOO_MAX_CLIENT_CNXNS: 1000
+
+  # Our incredible key-value store
+  redis-server:
+    image: redis:7.2.4
+    restart: always
+    hostname: redis-server
+    ports:
+      - '6379:6379'
+
+  # Graphical Interfaces to Inspect Redis and Zookeeper
+  redis-insight:
+    image: redis/redisinsight:latest
+    restart: always
+    hostname: redis-insight
+    ports:
+      - "5540:5540"
+
+  zoonavigator:
+    image: elkozmon/zoonavigator:0.7.1
+    container_name: zoonavigator
+    restart: always
+    hostname: zoo-navigator
+    ports:
+      - 9000:9000/tcp
+    environment:
+      HTTP_PORT: 9000
