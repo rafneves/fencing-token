@@ -11,7 +11,7 @@ import re
 from kazoo.client import KazooClient, KazooState
 from kazoo.exceptions import LockTimeout
 
-def main(process_transaction, run_redis_comparison_with_ground_truth, cleanup_redis_database, generate_all_transactions, run_transactions_processor_simple_lock, run_transactions_processor_fencing_lock, bcolors):
+def main():
     print("Generating transactions data ...")
     all_transactions = generate_all_transactions(n_users=50, n_max_transactions=230)
 
@@ -218,12 +218,12 @@ def run_transactions_processor_simple_lock(processor_name, transactions_to_proce
                         
                     redis_connection.set(user_id, json.dumps(user_purchase_state))
                 else:
-                    print(f"[Woker: {processor_name}]: Something changed before we could update the state of {user_id} for {transaction_id}. Retrying.")
+                    print(f"[Worker: {processor_name}]: Something changed before we could update the state of {user_id} for {transaction_id}. Retrying.")
 
                 try:                    
                     # Try to release the lock.
                     user_lock.release()
-                except:
+                except Exception:
                     pass
                 
                 # Process next transaction
@@ -249,7 +249,7 @@ def run_transactions_processor_fencing_lock(processor_name, transactions_to_proc
             raise Exception("For some reason I was disconnected from ZooKeeper. I will stop now.")
 
     redis_connection = Redis(host="localhost", port=6379, decode_responses=True)
-    locker_connection = KazooClient(hosts='127.0.0.1:2181')
+    locker_connection = KazooClient(hosts='127.0.0.1:2181,127.0.0.1:2182,127.0.0.1:2183')
     
     my_concrete_listener = lambda state: my_abstract_listener(locker_connection, state)
     while True:
@@ -343,4 +343,4 @@ class bcolors:
     UNDERLINE = '\033[4m'
 
 if __name__ == "__main__":
-    main(process_transaction, run_redis_comparison_with_ground_truth, cleanup_redis_database, generate_all_transactions, run_transactions_processor_simple_lock, run_transactions_processor_fencing_lock, bcolors)
+    main()
