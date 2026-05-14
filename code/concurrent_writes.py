@@ -59,8 +59,6 @@ def main():
         run_redis_comparison_with_ground_truth(all_users_purchases_state)
         print(bcolors.ENDC)
         
-        # Skip Exercise 2 until we fix the ZooKeeper issue.
-        #continue
         # Exercise 2 - Using Zookeeper Fencing Lock
         print(bcolors.OKCYAN)
         print(f"Exercise 2 - Using Zookeeper (Simulated Garbage Collector: {simulated_garbage_collector_pause})")   
@@ -215,19 +213,19 @@ def run_transactions_processor_simple_lock(processor_name, transactions_to_proce
                 if reread_exclusive_lock_token == current_exclusive_lock_token:
                     # Add a random pause to simulate an unpredictable garbage collector pause.
                     simulate_unpreditable_garbage_collector_pause(random_generator=random_generator, simulated_garbage_collector_pause=simulated_garbage_collector_pause)
-                        
                     redis_connection.set(user_id, json.dumps(user_purchase_state))
+                    try:
+                        user_lock.release()
+                    except Exception:
+                        pass
+                    break
                 else:
                     print(f"[Worker: {processor_name}]: Something changed before we could update the state of {user_id} for {transaction_id}. Retrying.")
-
-                try:                    
-                    # Try to release the lock.
-                    user_lock.release()
-                except Exception:
-                    pass
-                
-                # Process next transaction
-                break
+                    try:
+                        user_lock.release()
+                    except Exception:
+                        pass
+                    continue
     locker_connection.close()            
     redis_connection.close()
     
@@ -250,42 +248,17 @@ def run_transactions_processor_fencing_lock(processor_name, transactions_to_proc
 
     redis_connection = Redis(host="localhost", port=6379, decode_responses=True)
     locker_connection = KazooClient(hosts='127.0.0.1:2181,127.0.0.1:2182,127.0.0.1:2183')
-    
+
     my_concrete_listener = lambda state: my_abstract_listener(locker_connection, state)
     while True:
         locker_connection.start()
         if locker_connection.connected:
             locker_connection.add_listener(my_concrete_listener)
             break
-    
-    for transaction in transactions_to_process:
-        user_id = transaction["user_id"]
-    
-        while True:
-            # A new Lock object is created per attempt because kazoo's Lock does not support re-acquisition.
-            # ZooKeeper's sequential counter for a given path is 32-bit (~2.1 billion), which is not
-            # a practical concern at normal lock acquisition rates.
-            user_lock = locker_connection.Lock(f"/app/purchases_processor/users/state_lock/{user_id}", processor_name)
-            
-            lock_acquired = False
-            try:
-                lock_acquired = user_lock.acquire(blocking=True, timeout=0.2, ephemeral=True)
-            except LockTimeout:
-                continue
-                
-            if lock_acquired == True:
-                # ZooKeeper will add to the lock node a monotonically increasing number.
-                # Let's use it as our fencing token.
-                monotonic_lock_id = re.search(r"__lock__(\d+)", user_lock.node).group(1)
-                
-                user_purchase_state = json.loads(redis_connection.get(user_id) or '{}')
-                user_purchase_state = process_transaction(transaction, user_purchase_state)
 
-                # Add a random pause to simulate an unpredictable garbage collector pause.
-                simulate_unpreditable_garbage_collector_pause(random_generator=random_generator, simulated_garbage_collector_pause=simulated_garbage_collector_pause)
-                
-                # Submit the update to the database using fencing token inside a serializability.
-                fencing_token_logic_script = '''
+    # register_script computes the SHA once; subsequent calls use EVALSHA instead of
+    # sending the full script body on every transaction.
+    fencing_token_script = redis_connection.register_script('''
                     -- Implement fencing token logic using Lua Script on Redis.
                     -- We use Lua scripts because they are executed atomically.
 
@@ -305,17 +278,40 @@ def run_transactions_processor_fencing_lock(processor_name, transactions_to_proc
                     else
                         -- The fencing token is outdated.
                         return 0
-                    end                
-                '''
-                
+                    end
+    ''')
+
+    for transaction in transactions_to_process:
+        user_id = transaction["user_id"]
+
+        while True:
+            # A new Lock object is created per attempt because kazoo's Lock does not support re-acquisition.
+            # ZooKeeper's sequential counter for a given path is 32-bit (~2.1 billion), which is not
+            # a practical concern at normal lock acquisition rates.
+            user_lock = locker_connection.Lock(f"/app/purchases_processor/users/state_lock/{user_id}", processor_name)
+
+            lock_acquired = False
+            try:
+                lock_acquired = user_lock.acquire(blocking=True, timeout=0.2, ephemeral=True)
+            except LockTimeout:
+                continue
+
+            if lock_acquired == True:
+                # ZooKeeper will add to the lock node a monotonically increasing number.
+                # Let's use it as our fencing token.
+                monotonic_lock_id = re.search(r"__lock__(\d+)", user_lock.node).group(1)
+
+                user_purchase_state = json.loads(redis_connection.get(user_id) or '{}')
+                user_purchase_state = process_transaction(transaction, user_purchase_state)
+
+                # Add a random pause to simulate an unpredictable garbage collector pause.
+                simulate_unpreditable_garbage_collector_pause(random_generator=random_generator, simulated_garbage_collector_pause=simulated_garbage_collector_pause)
+
                 user_state_content = json.dumps(user_purchase_state)
                 fencing_token_key = f"__fencing_token:{user_id}"
-                update_status = redis_connection.eval(fencing_token_logic_script,
-                                      2,
-                                      user_id, 
-                                      fencing_token_key,                                      
-                                      user_state_content,
-                                      monotonic_lock_id,
+                update_status = fencing_token_script(
+                                      keys=[user_id, fencing_token_key],
+                                      args=[user_state_content, monotonic_lock_id],
                                       )
                 
                 user_lock.release()
