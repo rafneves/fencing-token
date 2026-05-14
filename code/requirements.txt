@@ -1,3 +1,2 @@
 redis
-redis-lock
 kazoo

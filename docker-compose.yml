@@ -1,10 +1,9 @@
-version: '3.1'
-name: chap8-practical-examples
+name: fencing-token-demo
 
 services:
-  # Zookeeper in a 3 node cluster (we need even number of nodes to have a majority and avoid split-brain).
+  # ZooKeeper in a 3-node cluster (odd number of nodes required for quorum majority and to avoid split-brain).
   zoo1:
-    image: zookeeper
+    image: zookeeper:3.9.5
     restart: always
     hostname: zoo1
     ports:
@@ -18,7 +17,7 @@ services:
       ZOO_MAX_CLIENT_CNXNS: 1000
 
   zoo2:
-    image: zookeeper
+    image: zookeeper:3.9.5
     restart: always
     hostname: zoo2
     ports:
@@ -32,7 +31,7 @@ services:
       ZOO_MAX_CLIENT_CNXNS: 1000
 
   zoo3:
-    image: zookeeper
+    image: zookeeper:3.9.5
     restart: always
     hostname: zoo3
     ports:
@@ -45,9 +44,9 @@ services:
       # Set the number of maximum of concurrent client connections allowed by Zookeeper.
       ZOO_MAX_CLIENT_CNXNS: 1000
 
-  # Our incredible key-value store
+  # Our incredible key-value store (Valkey is the open source BSD-3 fork of Redis)
   redis-server:
-    image: redis:7.2.4
+    image: valkey/valkey:8.1.7
     restart: always
     hostname: redis-server
     ports:
@@ -55,15 +54,14 @@ services:
 
   # Graphical Interfaces to Inspect Redis and Zookeeper
   redis-insight:
-    image: redis/redisinsight:latest
+    image: redis/redisinsight:3.4.2
     restart: always
     hostname: redis-insight
     ports:
       - "5540:5540"
 
   zoonavigator:
-    image: elkozmon/zoonavigator:0.7.1
-    container_name: zoonavigator
+    image: elkozmon/zoonavigator:2.0.0
     restart: always
     hostname: zoo-navigator
     ports:
