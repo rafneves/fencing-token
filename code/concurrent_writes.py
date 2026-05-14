@@ -11,6 +11,82 @@ import re
 from kazoo.client import KazooClient, KazooState
 from kazoo.exceptions import LockTimeout
 
+def main(process_transaction, run_redis_comparison_with_ground_truth, cleanup_redis_database, generate_all_transactions, run_transactions_processor_simple_lock, run_transactions_processor_fencing_lock, bcolors):
+    print("Generating transactions data ...")
+    all_transactions = generate_all_transactions(n_users=50, n_max_transactions=230)
+
+    # Generate the true state of the users to be compared with each one.
+    all_users_purchases_state = {}
+    for transaction in all_transactions:
+        all_users_purchases_state = process_transaction(transaction, all_users_purchases_state)
+    
+    max_number_of_workers = 110
+
+    # Separate the transactions into batches.
+    if len(all_transactions) % max_number_of_workers == 0:
+        BATCH_SIZE = (len(all_transactions) // max_number_of_workers)
+    else:
+        BATCH_SIZE = (len(all_transactions) // max_number_of_workers) + 1
+        
+    transactions_batches = [
+        all_transactions[i : i + BATCH_SIZE]
+        for i in range(0, len(all_transactions), BATCH_SIZE)
+    ]
+    
+    for simulated_garbage_collector_pause in [True, False]:        
+        # Exercise 1 - Using Redislock   
+        print(bcolors.OKGREEN)
+        print(f"Exercise 1 - Using Redislock (Simulated Garbage Collector: {simulated_garbage_collector_pause})")
+        print(f"Number of Workers: {len(transactions_batches)}.")            
+        cleanup_redis_database(host="localhost", port=6379)
+
+        redislock_start = time.time()
+        procs = []
+        for batch_id in range(len(transactions_batches)):    
+            worker_name = f"worker_{batch_id}"
+            transactions_to_process = transactions_batches[batch_id]
+            #run_transactions_processor_simple_lock
+            proc = Process(target=run_transactions_processor_simple_lock, args=(worker_name,transactions_to_process, simulated_garbage_collector_pause))
+            procs.append(proc)
+            proc.start()
+
+        for proc in procs:
+            proc.join()
+        redislock_end = time.time()
+
+        print(f"Elapsed wall time for: {redislock_end - redislock_start}")
+        print("Checking the consistency of Redislock with unpredictable timeouts:")
+        run_redis_comparison_with_ground_truth(all_users_purchases_state)
+        print(bcolors.ENDC)
+        
+        # Skip Exercise 2 until we fix the ZooKeeper issue.
+        #continue
+        # Exercise 2 - Using Zookeeper Fencing Lock
+        print(bcolors.OKCYAN)
+        print(f"Exercise 2 - Using Zookeeper (Simulated Garbage Collector: {simulated_garbage_collector_pause})")   
+        print(f"Number of Workers: {len(transactions_batches)}.")            
+        cleanup_redis_database(host="localhost", port=6379)
+    
+        zookeeper_start = time.time()
+        procs = []
+        for batch_id in range(len(transactions_batches)):    
+            worker_name = f"worker_{batch_id}"
+            transactions_to_process = transactions_batches[batch_id]
+            #run_transactions_processor_simple_lock
+            proc = Process(target=run_transactions_processor_fencing_lock, args=(worker_name,transactions_to_process, simulated_garbage_collector_pause))
+            procs.append(proc)
+            proc.start()
+
+        for proc in procs:
+            proc.join()
+        zookeeper_end = time.time()
+
+        print(f"Elapsed wall time for: {zookeeper_end - zookeeper_start}")
+        print("Checking the consistency of Zookeeper Locker with unpredictable timeouts:")
+        run_redis_comparison_with_ground_truth(all_users_purchases_state)
+        print(bcolors.ENDC)
+
+
 """Updates the purchase state of a player."""
 def process_transaction(transaction, users_purchases_state):
     # Make a deep copy so mutable state cannot be blamed for inconsistencies.
@@ -94,8 +170,6 @@ def generate_all_transactions(n_users, n_max_transactions):
     return all_transactions
 
 ### Example 2: Processing transactions concurrently and subject to Garbage Collector pauses.
-
-
 def run_transactions_processor_simple_lock(processor_name, transactions_to_process, simulated_garbage_collector_pause):
     # Make a deep copy so mutable state cannot be blamed for inconsistencies.    
     transactions_to_process = copy.deepcopy(transactions_to_process)
@@ -188,7 +262,9 @@ def run_transactions_processor_fencing_lock(processor_name, transactions_to_proc
         user_id = transaction["user_id"]
     
         while True:
-            # Warning: You shouldn't create nodes indefinitely. It is just to avoid overloading the integer counter. 
+            # A new Lock object is created per attempt because kazoo's Lock does not support re-acquisition.
+            # ZooKeeper's sequential counter for a given path is 32-bit (~2.1 billion), which is not
+            # a practical concern at normal lock acquisition rates.
             user_lock = locker_connection.Lock(f"/app/purchases_processor/users/state_lock/{user_id}", processor_name)
             
             lock_acquired = False
@@ -213,10 +289,11 @@ def run_transactions_processor_fencing_lock(processor_name, transactions_to_proc
                     -- Implement fencing token logic using Lua Script on Redis.
                     -- We use Lua scripts because they are executed atomically.
 
-                    -- WARNING: We need two keys per-user to implement fencing token logic. Otherwise,
-                    -- we would need to serialize and deserialzed using cjson.
+                    -- Two keys per user: one for the state, one for the fencing token.
+                    -- Keeping them separate avoids deserializing the full state blob just to compare tokens.
 
-                    -- WARNING: It can overflow the number limit in Redis!
+                    -- tonumber() is safe here: ZooKeeper's counter is 32-bit (max ~2.1B), which fits
+                    -- exactly in a Lua number (IEEE 754 double, exact integers up to 2^53).
                     local current_fencing_token = tonumber(redis.call("get", KEYS[2]))
                     local new_fencing_token_candidate = tonumber(ARGV[2])
 
@@ -266,76 +343,4 @@ class bcolors:
     UNDERLINE = '\033[4m'
 
 if __name__ == "__main__":
-    print("Generating transactions data ...")
-    all_transactions = generate_all_transactions(n_users=50, n_max_transactions=230)
-
-    # Generate the true state of the users to be compared with each one.
-    all_users_purchases_state = {}
-    for transaction in all_transactions:
-        all_users_purchases_state = process_transaction(transaction, all_users_purchases_state)
-    
-    max_number_of_workers = 110
-
-    # Separate the transactions into batches.
-    if len(all_transactions) % max_number_of_workers == 0:
-        BATCH_SIZE = (len(all_transactions) // max_number_of_workers)
-    else:
-        BATCH_SIZE = (len(all_transactions) // max_number_of_workers) + 1
-        
-    transactions_batches = [
-        all_transactions[i : i + BATCH_SIZE]
-        for i in range(0, len(all_transactions), BATCH_SIZE)
-    ]
-    
-    for simulated_garbage_collector_pause in [True, False]:        
-        # Exercise 1 - Using Redislock   
-        print(bcolors.OKGREEN)
-        print(f"Exercise 1 - Using Redislock (Simulated Garbage Collector: {simulated_garbage_collector_pause})")
-        print(f"Number of Workers: {len(transactions_batches)}.")            
-        cleanup_redis_database(host="localhost", port=6379)
-
-        redislock_start = time.time()
-        procs = []
-        for batch_id in range(len(transactions_batches)):    
-            worker_name = f"worker_{batch_id}"
-            transactions_to_process = transactions_batches[batch_id]
-            #run_transactions_processor_simple_lock
-            proc = Process(target=run_transactions_processor_simple_lock, args=(worker_name,transactions_to_process, simulated_garbage_collector_pause))
-            procs.append(proc)
-            proc.start()
-
-        for proc in procs:
-            proc.join()
-        redislock_end = time.time()
-
-        print(f"Elapsed wall time for: {redislock_end - redislock_start}")
-        print("Checking the consistency of Redislock with unpredictable timeouts:")
-        run_redis_comparison_with_ground_truth(all_users_purchases_state)
-        print(bcolors.ENDC)
-        
-        # Skip Exercise 2 until we fix the ZooKeeper issue.
-        #continue
-        # Exercise 2 - Using Zookeeper Fencing Lock
-        print(bcolors.OKCYAN)
-        print(f"Exercise 2 - Using Zookeeper (Simulated Garbage Collector: {simulated_garbage_collector_pause})")   
-        print(f"Number of Workers: {len(transactions_batches)}.")            
-        cleanup_redis_database(host="localhost", port=6379)
-    
-        zookeeper_start = time.time()
-        procs = []
-        for batch_id in range(len(transactions_batches)):    
-            worker_name = f"worker_{batch_id}"
-            transactions_to_process = transactions_batches[batch_id]
-            #run_transactions_processor_simple_lock
-            proc = Process(target=run_transactions_processor_fencing_lock, args=(worker_name,transactions_to_process, simulated_garbage_collector_pause))
-            procs.append(proc)
-            proc.start()
-
-        for proc in procs:
-            proc.join()
-        zookeeper_end = time.time()
-
-        print(f"Elapsed wall time for: {zookeeper_end - zookeeper_start}")
-        print("Checking the consistency of Zookeeper Locker with unpredictable timeouts:")
-        run_redis_comparison_with_ground_truth(all_users_purchases_state)
-        print(bcolors.ENDC)
+    main(process_transaction, run_redis_comparison_with_ground_truth, cleanup_redis_database, generate_all_transactions, run_transactions_processor_simple_lock, run_transactions_processor_fencing_lock, bcolors)
