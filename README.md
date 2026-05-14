@@ -69,6 +69,72 @@ pip install -r requirements.txt
 python concurrent_writes.py
 ```
 
+## The Window of Vulnerability
+
+Any delay between acquiring the lock and completing the write is a window for corruption — regardless of cause:
+
+- **Process suspension** — GC pause, OS scheduling jitter, VM or container suspension
+- **Slow or retried write to Redis** — the lock expires while the write is still in flight
+- **Redis connection timeout** — the worker retries a write that already landed, or lands it after another worker committed newer state
+- **Network partition to ZooKeeper** — the lock appears held but the session is already gone
+
+A GC pause is just the most concrete and reproducible example to demo. The fencing token handles all of these cases by reinstating **total ordering** on writes — any write carrying a token older than the last accepted one is provably out of order and rejected, regardless of why it arrived late.
+
+## How GC Pauses Are Simulated
+
+Implemented in `simulate_unpreditable_garbage_collector_pause`. Each transaction has a **0.5% chance** of triggering a `time.sleep` injected *after* the lock is acquired and *before* the write — the exact window described above. The duration is drawn from an **exponential distribution** (mean 400ms) to mimic the unpredictability of real stop-the-world events.
+
+## Sample Output
+
+**With GC pauses enabled**, RedisLock silently loses data for 30 out of 50 users — errors ranging from under 1% to over 24%. ZooKeeper is consistent, at the cost of ~2.4× the wall time.
+
+**Without GC pauses**, the picture improves but RedisLock *still* produces 3 inconsistencies from normal lock contention alone. ZooKeeper remains consistent.
+
+```
+Exercise 1 - Using Redislock (Simulated Garbage Collector: True)
+Number of Workers: 110.
+[Worker: worker_25]: Something changed before we could update the state of my_game_id:my_user_id_00024 for my_game_id:my_user_id_00024:00189. Retrying.
+[Worker: worker_47]: Something changed before we could update the state of my_game_id:my_user_id_00041 for my_game_id:my_user_id_00041:00449. Retrying.
+[Worker: worker_37]: Something changed before we could update the state of my_game_id:my_user_id_00024 for my_game_id:my_user_id_00024:00562. Retrying.
+[Worker: worker_43]: Something changed before we could update the state of my_game_id:my_user_id_00030 for my_game_id:my_user_id_00030:00084. Retrying.
+Elapsed wall time for: 20.455346822738647
+Checking the consistency of Redislock with unpredictable timeouts:
+User my_game_id:my_user_id_00016 has an inconsistent state. True: 24612 != Redis: 23835. Percentual Error: 3.16%.
+User my_game_id:my_user_id_00005 has an inconsistent state. True: 22195 != Redis: 20598. Percentual Error: 7.2%.
+User my_game_id:my_user_id_00035 has an inconsistent state. True: 19449 != Redis: 18758. Percentual Error: 3.55%.
+User my_game_id:my_user_id_00028 has an inconsistent state. True: 33652 != Redis: 32511. Percentual Error: 3.39%.
+[... snip... ]
+User my_game_id:my_user_id_00048 has an inconsistent state. True: 21140 != Redis: 19561. Percentual Error: 7.47%.
+User my_game_id:my_user_id_00008 has an inconsistent state. True: 19286 != Redis: 18941. Percentual Error: 1.79%.
+User my_game_id:my_user_id_00046 has an inconsistent state. True: 15494 != Redis: 15154. Percentual Error: 2.19%.
+User my_game_id:my_user_id_00021 has an inconsistent state. True: 16634 != Redis: 15377. Percentual Error: 7.56%.
+
+Exercise 2 - Using Zookeeper (Simulated Garbage Collector: True)
+Number of Workers: 110.
+Elapsed wall time for: 48.89732885360718
+Checking the consistency of Zookeeper Locker with unpredictable timeouts:
+The results are consistent.
+
+
+Exercise 1 - Using Redislock (Simulated Garbage Collector: False)
+Number of Workers: 110.
+[Worker: worker_3]: Something changed before we could update the state of my_game_id:my_user_id_00028 for my_game_id:my_user_id_00028:00235. Retrying.
+[Worker: worker_20]: Something changed before we could update the state of my_game_id:my_user_id_00048 for my_game_id:my_user_id_00048:00401. Retrying.
+Elapsed wall time for: 18.47313380241394
+Checking the consistency of Redislock with unpredictable timeouts:
+User my_game_id:my_user_id_00028 has an inconsistent state. True: 33652 != Redis: 33614. Percentual Error: 0.11%.
+User my_game_id:my_user_id_00039 has an inconsistent state. True: 22435 != Redis: 22344. Percentual Error: 0.41%.
+User my_game_id:my_user_id_00048 has an inconsistent state. True: 21140 != Redis: 21133. Percentual Error: 0.03%.
+
+Exercise 2 - Using Zookeeper (Simulated Garbage Collector: False)
+Number of Workers: 110.
+Elapsed wall time for: 45.27469205856323
+Checking the consistency of Zookeeper Locker with unpredictable timeouts:
+The results are consistent.
+```
+
+> **Note on "Retrying" lines:** the re-read token check catches some races, but not all — a GC pause after the check silently lets a stale write through with no retry and no error. The GC=False run shows the same: even without artificial pauses, normal lock expiry under contention is enough to lose 3 writes.
+
 ## Inspecting State via GUIs
 
 | Service | URL | Notes |
